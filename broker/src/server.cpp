@@ -5,10 +5,14 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <cerrno>
+#include <string>
+#include <unordered_map>
 
 #define PORT 8080
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 1024
+
+std :: unordered_map<int, std:: string> client_buffers ;
 
 void make_sockets_nonblocking(int socket_fd){
 	int flags = fcntl(socket_fd , F_GETFL , 0) ;
@@ -67,7 +71,7 @@ int main(){
 		return 1; 
 	}
 
-	std :: cout << "Booted succesfully , listening on PORT " << PORT ;
+	std :: cout << "Booted succesfully , listening on PORT " << PORT << std::endl ;
 
 	while (true){
 		int num_events = epoll_wait(epoll_fd , events , MAX_EVENTS , -1) ;
@@ -115,7 +119,13 @@ int main(){
 					ssize_t bytes_read = read(client_fd,buffer,sizeof(buffer) - 1) ;
 					
 					if(bytes_read > 0){
-						write(client_fd , buffer , bytes_read) ;
+						client_buffers[client_fd].append(buffer,bytes_read) ;
+						size_t pos ;
+						while((pos = client_buffers[client_fd].find('\n')) != std:: string:: npos){
+							std:: string complete_msg = client_buffers[client_fd].substr(0,pos) ;
+							std :: cout << "[FD " << client_fd << "] : message recieved : " << complete_msg << std::endl;
+							client_buffers[client_fd].erase(0,pos+1) ;
+						}
 					}
 					else if(bytes_read == 0){
 						std :: cout << "[Broker] Worker disconnected. FD: " << client_fd << std :: endl ;
