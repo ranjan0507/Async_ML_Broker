@@ -7,12 +7,23 @@
 #include <cerrno>
 #include <string>
 #include <unordered_map>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+#include <thread>
 
 #define PORT 8080
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 1024
+#define NUM_DISPATCHER 4
 
 std :: unordered_map<int, std:: string> client_buffers ;
+std :: queue<std::string> task_queue ;
+std :: queue<int> idle_workers ;
+
+std :: mutex broker_mutex ;
+std :: condition_variable broker_cv ;
 
 void make_sockets_nonblocking(int socket_fd){
 	int flags = fcntl(socket_fd , F_GETFL , 0) ;
@@ -26,7 +37,47 @@ void make_sockets_nonblocking(int socket_fd){
 	}
 }
 
+void dispatch_loop(int thread_id){
+	while(true){
+		std:: string task ;
+		int worker_fd ;
+
+		{
+			std:: unique_lock<std:: mutex> lock(broker_mutex) ;
+			broker_cv.wait(lock , []{
+				return !task_queue.empty() && !idle_workers.empty() ;
+			}) ;
+			task = task_queue.front() ;
+			task_queue.pop() ;
+			worker_fd = idle_workers.front() ;
+			idle_workers.pop() ;
+		}
+
+		std:: string payload = task + "\n" ;
+		ssize_t sent = write(worker_fd,payload.c_str(),payload.length()) ;
+		if(sent <= 0){
+			std :: cout << "[Dispatcher " << thread_id << "] Worker FD " << worker_fd << " died . Requeing task \n" ;
+			close(worker_fd) ;
+
+			{
+				std :: lock_guard<std :: mutex> lock(broker_mutex) ;
+				task_queue.push(task) ;
+			}
+			broker_cv.notify_one() ;
+		}else{
+			std:: cout << "[Dispatcher " << thread_id << "] Successfully dispatched task to Worker FD " << worker_fd << "\n" ;
+		}
+	}
+}
+
 int main(){
+
+	std:: vector<std:: thread> thread_pool ;
+	for(int i=0 ; i<NUM_DISPATCHER ; i++){
+		thread_pool.emplace_back(std:: thread(dispatch_loop,i+1)) ;
+	}
+	std::cout << "[Broker] Spawned " << NUM_DISPATCHER << " background Dispatcher Threads \n" ;
+
 	int server_fd = socket(AF_INET , SOCK_STREAM , 0) ;
 	if(server_fd == -1){
 		perror("socket creation failed") ;
@@ -121,10 +172,28 @@ int main(){
 					if(bytes_read > 0){
 						client_buffers[client_fd].append(buffer,bytes_read) ;
 						size_t pos ;
+						
 						while((pos = client_buffers[client_fd].find('\n')) != std:: string:: npos){
+
 							std:: string complete_msg = client_buffers[client_fd].substr(0,pos) ;
 							std :: cout << "[FD " << client_fd << "] : message recieved : " << complete_msg << std::endl;
 							client_buffers[client_fd].erase(0,pos+1) ;
+							if(complete_msg == "WORKER_READY"){
+								{
+									std:: lock_guard<std::mutex> lock(broker_mutex) ;
+									idle_workers.push(client_fd) ;
+								}
+								broker_cv.notify_one() ;
+								std:: cout << "[Gateway] Worker FD " << client_fd << "registered as IDLE \n" ;
+							}else{
+								{
+									std:: lock_guard<std::mutex> lock(broker_mutex) ;
+									task_queue.push(complete_msg) ;
+								}
+								broker_cv.notify_one() ;
+								std:: cout << "[Gateway] Task recieved . Pushed to Queue \n" ;
+								write(client_fd,"ACK_ACCEPTED\n",13) ;
+							}
 						}
 					}
 					else if(bytes_read == 0){
