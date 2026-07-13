@@ -1,1 +1,5 @@
-my_broker
+broker/src/my_broker
+.venv/
+build/
+*.egg-info/
+__pycache__/
