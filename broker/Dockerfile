@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN g++ -o my_broker src/server.cpp
+RUN make
 
 EXPOSE 8080
 

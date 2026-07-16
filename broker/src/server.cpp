@@ -192,7 +192,16 @@ int main(){
 								}
 								broker_cv.notify_one() ;
 								std:: cout << "[Gateway] Task recieved . Pushed to Queue \n" ;
-								write(client_fd,"ACK_ACCEPTED\n",13) ;
+								ssize_t ack_sent = write(client_fd,"ACK_ACCEPTED\n",13);
+								if(ack_sent <= 0){
+    								std::cerr << "[Broker] Failed to send ACK to publisher FD " << client_fd << std::endl;
+    								close(client_fd);
+    								epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+    								{
+        								std::lock_guard<std::mutex> lock(broker_mutex);
+        								client_buffers.erase(client_fd);
+    								}
+								}
 							}
 						}
 					}
