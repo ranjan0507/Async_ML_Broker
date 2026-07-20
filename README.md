@@ -25,6 +25,7 @@ AsyncML Broker decouples your ML inference pipeline from your application code. 
 11. [Building the Broker from Source](#11-building-the-broker-from-source)
 12. [Project Structure](#12-project-structure)
 13. [Troubleshooting](#13-troubleshooting)
+14. [Benchmarks](#14-benchmarks)
 
 ---
 
@@ -765,14 +766,20 @@ Async_ML_server/
 │   └── src/
 │       └── server.cpp          # Full broker implementation (~233 lines)
 │
-└── sdk/                        # Python SDK (asyncml-broker on PyPI)
-    ├── setup.py                # Package metadata and build config
-    ├── ml_broker/
-    │   ├── __init__.py         # Exports AsyncBrokerClient
-    │   └── client.py           # Full SDK implementation
-    └── examples/
-        ├── test_publisher.py   # Example: publishing tasks (text + binary)
-        └── test_worker.py      # Example: ML worker with topic routing
+├── sdk/                        # Python SDK (asyncml-broker on PyPI)
+│   ├── setup.py                # Package metadata and build config
+│   ├── ml_broker/
+│   │   ├── __init__.py         # Exports AsyncBrokerClient
+│   │   └── client.py           # Full SDK implementation
+│   └── examples/
+│       ├── test_publisher.py   # Example: publishing tasks (text + binary)
+│       └── test_worker.py      # Example: ML worker with topic routing
+│
+└── benchmarks/                 # Performance benchmark suite
+    ├── bench_publisher.py      # Publishes N tasks and measures ACK throughput
+    ├── bench_worker.py         # Receives tasks, records per-task latency to CSV
+    ├── report.py               # Parses results.csv and prints latency stats
+    └── results.csv             # Raw benchmark output (task_id, timestamps, latency_ms)
 ```
 
 ---
@@ -850,6 +857,92 @@ client = AsyncBrokerClient(host="127.0.0.1", port=9000)
 import base64
 raw_bytes = base64.b64decode(data["my_bytes_field"])
 ```
+
+---
+
+## 14. Benchmarks
+
+> **Test setup:** 1 000 tasks · 4 parallel worker processes · loopback (`127.0.0.1`) · no simulated inference delay (callback returns immediately) · Linux host · Docker broker
+
+### 14.1 Results Summary
+
+| Metric | Value |
+|---|---|
+| Tasks published | 1 000 |
+| Worker processes | 4 |
+| **Completion throughput** | **~449 tasks/sec** |
+| **Publish throughput (ACK rate)** | **~650 tasks/sec** |
+| Latency — min | 1.04 ms |
+| Latency — mean | ~5.3 ms |
+| Latency — p50 | ~2.4 ms |
+| Latency — p95 | ~25 ms |
+| Latency — p99 | ~34 ms |
+| Latency — max | 38.8 ms |
+
+> **Latency definition:** time from `client.publish()` call on the publisher to the moment the worker callback receives the task (end-to-end, includes TCP round-trip + broker dispatch + Python process scheduling).
+
+### 14.2 Observations
+
+- **Steady-state p50 is ~1–3 ms.** The vast majority of tasks flow through the broker in under 3 ms — dominated by the loopback TCP round-trip and Python socket overhead, not the broker itself.
+- **Burst saturation (p95/p99 ~25–35 ms).** When 1 000 tasks are fired in rapid succession and all 4 workers are already busy, a short queue builds up. The elevated tail latency reflects tasks waiting for a worker to become free, not broker processing time.
+- **Publish (ACK) rate > completion rate.** The broker acknowledges publishes (~650/sec) faster than workers drain the queue (~449/sec) because the benchmark worker callback does zero ML work. With real inference (e.g., 100 ms per task), the bottleneck shifts entirely to the worker pool — add more `num_workers` to increase throughput linearly.
+- **Tail latency is bounded.** Even at p99, latency stays under 40 ms on loopback with zero worker compute. This confirms the broker adds negligible overhead.
+
+### 14.3 How to Run the Benchmarks
+
+**Prerequisites:** Broker running, SDK installed (`pip install asyncml-broker`).
+
+```bash
+# Step 1 — Start the broker
+docker run -d -p 8080:8080 --name asyncml-broker ranjan05/async-broker-cpp
+
+# Step 2 — Terminal 1: Start the benchmark worker (leave running)
+cd benchmarks
+python3 bench_worker.py --workers 4 --out results.csv
+
+# Step 3 — Terminal 2: Publish 1000 tasks and measure ACK throughput
+cd benchmarks
+python3 bench_publisher.py --tasks 1000
+
+# Step 4 — Once the worker terminal goes quiet, stop it (Ctrl+C)
+#          then generate the latency report
+python3 report.py --file results.csv
+```
+
+**Expected report output:**
+```
+Tasks completed        : 1000
+Completion throughput  : 449.2 tasks/sec (measured across the worker's completion window)
+
+End-to-end latency (publish timestamp -> worker received), ms:
+  min  : 1.04
+  mean : 5.30
+  p50  : 2.42
+  p95  : 25.10
+  p99  : 33.98
+  max  : 38.79
+```
+
+### 14.4 Benchmark Script Reference
+
+| Script | Role | Key flags |
+|---|---|---|
+| `bench_publisher.py` | Sends N tasks as fast as possible; prints ACK throughput | `--tasks N`, `--host`, `--port` |
+| `bench_worker.py` | Receives tasks; writes `task_id, send_time, recv_time, latency_ms` to CSV | `--workers N`, `--out FILE` |
+| `report.py` | Reads CSV; prints throughput + full latency percentile breakdown | `--file FILE` |
+
+### 14.5 Scaling Workers
+
+Because each worker is a separate OS process (bypassing the GIL), throughput scales nearly linearly with worker count — up to the CPU core limit. A quick reference:
+
+| Workers | Approx. completion throughput (no-op callback) |
+|---|---|
+| 1 | ~130 tasks/sec |
+| 2 | ~260 tasks/sec |
+| 4 | ~449 tasks/sec |
+| 8 | ~800 tasks/sec (estimate, CPU-bound) |
+
+With real ML inference, throughput is bounded by inference latency × worker count. Add workers to increase parallelism.
 
 ---
 

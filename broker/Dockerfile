@@ -8,4 +8,4 @@ RUN make
 
 EXPOSE 8080
 
-CMD ["./my_broker"]
+CMD ["./src/my_broker"]
